@@ -5,11 +5,13 @@ import gc
 import numpy as np
 import math
 from tqdm import tqdm
+from typing import Dict
 
 from accelerate import init_empty_weights
 from accelerate.utils import set_module_tensor_to_device
 
 import folder_paths
+import comfy
 import comfy.model_management as mm
 from comfy.utils import load_torch_file, ProgressBar, common_upscale
 import comfy.model_base
@@ -24,6 +26,15 @@ from .diffusers_helper.memory import DynamicSwapInstaller, move_model_to_device_
 from .diffusers_helper.pipelines.k_diffusion_hunyuan import sample_hunyuan
 from .diffusers_helper.utils import crop_or_pad_yield_mask
 from .diffusers_helper.bucket_tools import find_nearest_bucket
+
+BSINGLE = "single_blocks"
+BDOUBLE = "double_blocks"
+PRESET_BLOCKS = {
+    "single_blocks": (BSINGLE, None),
+    "double_blocks": (BDOUBLE, None),
+    "db0-9": (BDOUBLE, list(range(0, 10))),
+    "db10-19": (BDOUBLE, list(range(10, 20))),
+}
 
 class HyVideoModel(comfy.model_base.BaseModel):
     def __init__(self, *args, **kwargs):
@@ -262,6 +273,124 @@ class FramePackFindNearestBucket:
 
         return (new_width, new_height, )
 
+# inspired from the work of https://github.com/facok/ComfyUI-HunyuanVideoMultiLora
+class FramePackLoRALoader:
+    """
+    Load/apply a LoRA onto a FramePack transformer by directly patching weights.
+    Supports selecting all/single/double blocks or specific db ranges.
+    """
+    # class-level cache so _cache always exists
+    _cache = None  # tuple(path, raw_lora_dict)
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("FramePackMODEL",),
+                "lora_name": (folder_paths.get_filename_list("loras"),),
+                "strength": (
+                    "FLOAT", {
+                        "default": 1.0,
+                        "min": -10.0,
+                        "max": 10.0,
+                        "step": 0.01,
+                        "display": "number"
+                    }
+                ),
+                "blocks_type": (["all","single_blocks","double_blocks","db0-9","db10-19"],),
+            }
+        }
+
+    RETURN_TYPES = ("FramePackMODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "load_lora"
+    CATEGORY = "FramePackWrapper"
+    DESCRIPTION = "Apply a LoRA to your FramePack model by directly modifying the transformer weights."
+
+    def _convert_key(self, k: str) -> str:
+        for p in ("diffusion_model.", "transformer."):
+            if k.startswith(p):
+                return k[len(p):]
+        return k
+
+    def _filter(self, raw: Dict[str,torch.Tensor], bt: str) -> Dict[str,torch.Tensor]:
+        if bt == "all":
+            return raw
+        name, layers = PRESET_BLOCKS[bt]
+        out = {}
+        for k,v in raw.items():
+            ck = self._convert_key(k)
+            if name not in ck:
+                continue
+            if layers is not None:
+                parts = ck.split(".")
+                try:
+                    idx = int(parts[parts.index(name)+1])
+                except Exception:
+                    continue
+                if idx not in layers:
+                    continue
+            out[k] = v
+        return out
+
+    def load_lora(self, model, lora_name, strength, blocks_type):
+        # nothing to do?
+        if not lora_name:
+            return (model,)
+
+        # resolve path
+        path = folder_paths.get_full_path("loras", lora_name)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"LoRA not found: {path}")
+
+        # load & cache raw dict on the class
+        cls = type(self)
+        if cls._cache is None or cls._cache[0] != path:
+            raw = load_torch_file(path)
+            cls._cache = (path, raw)
+        else:
+            raw = cls._cache[1]
+
+        # filter by blocks_type
+        lora_weights = self._filter(raw, blocks_type)
+
+        # apply each A/B pair directly into transformer weights
+        transformer = model["transformer"]
+        for a_key, A in list(lora_weights.items()):
+            if not a_key.endswith(".lora_A.weight"):
+                continue
+            b_key = a_key.replace(".lora_A.weight", ".lora_B.weight")
+            B = lora_weights.get(b_key)
+            if B is None:
+                continue
+
+            # find module
+            target = a_key.replace("diffusion_model.", "").replace(".lora_A.weight", ".weight")
+            parts = target.split(".")
+            module = transformer
+            for p in parts[:-1]:
+                if hasattr(module, p):
+                    module = getattr(module, p)
+                else:
+                    try:
+                        idx = int(p)
+                        module = module[idx]
+                    except Exception:
+                        module = None
+                        break
+            if module is None or not hasattr(module, "weight"):
+                continue
+
+            # patch: W += strength * (B @ A)
+            delta = B.to(module.weight.device) @ A.to(module.weight.device)
+            module.weight.data += strength * delta
+
+        return (model,)
+
+    @classmethod
+    def IS_CHANGED(s, model, lora_name, strength, blocks_type):
+        return f"{lora_name}_{strength}_{blocks_type}"
+
 
 class FramePackSampler:
     @classmethod
@@ -357,7 +486,7 @@ class FramePackSampler:
         num_frames = latent_window_size * 4 - 3
 
         history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32).cpu()
-       
+
         total_generated_latent_frames = 0
 
         latent_paddings_list = list(reversed(range(total_latent_sections)))
@@ -368,7 +497,7 @@ class FramePackSampler:
                 model_type=comfy.model_base.ModelType.FLOW,
                 device=device,
             )
-      
+
         patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, torch.device("cpu"))
         from latent_preview import prepare_callback
         callback = prepare_callback(patcher, steps)
@@ -437,7 +566,6 @@ class FramePackSampler:
                 end_idx = min(start_idx + latent_window_size, total_length)
                 print(f"start_idx: {start_idx}, end_idx: {end_idx}, total_length: {total_length}")
                 input_init_latents = initial_samples[:, :, start_idx:end_idx, :, :].to(device)
-          
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_rel_l1_thresh)
@@ -500,6 +628,7 @@ NODE_CLASS_MAPPINGS = {
     "FramePackTorchCompileSettings": FramePackTorchCompileSettings,
     "FramePackFindNearestBucket": FramePackFindNearestBucket,
     "LoadFramePackModel": LoadFramePackModel,
+    "FramePackLoRALoader": FramePackLoRALoader,
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadFramePackModel": "(Down)Load FramePackModel",
@@ -507,5 +636,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "FramePackTorchCompileSettings": "Torch Compile Settings",
     "FramePackFindNearestBucket": "Find Nearest Bucket",
     "LoadFramePackModel": "Load FramePackModel",
+    "FramePackLoRALoader": "FramePack LoRA Loader",
     }
 
