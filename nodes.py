@@ -287,8 +287,11 @@ class LoadFramePackModel:
                 lora_sd = _convert_hunyuan_video_lora_to_diffusers(lora_sd)
 
                 # Use the provided blocks dictionary in `l["blocks"]`
-                selected_blocks = l["blocks"]
-                filtered_lora_sd = filter_lora_sd_by_blocks(lora_sd, selected_blocks)
+                selected_blocks = l.get("blocks")
+                if selected_blocks is not None:
+                    filtered_lora_sd = filter_lora_sd_by_blocks(lora_sd, selected_blocks)
+                else:
+                    filtered_lora_sd = lora_sd
 
                 lora_rank = None
                 for key, val in filtered_lora_sd.items():
