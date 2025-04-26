@@ -171,6 +171,7 @@ class FramePackLoraSelect:
                 "fuse_lora": ("BOOLEAN", {"default": True, "tooltip": "Fuse the LORA model with the base model. This is recommended for better performance."}),
             },
             "optional": {
+                "blocks":("SELECTEDBLOCKS", ),
                 "prev_lora":("FPLORA", {"default": None, "tooltip": "For loading multiple LoRAs"}),
             }
         }
@@ -181,7 +182,7 @@ class FramePackLoraSelect:
     CATEGORY = "FramePackWrapper"
     DESCRIPTION = "Select a LoRA model from ComfyUI/models/loras"
 
-    def getlorapath(self, lora, strength, prev_lora=None, fuse_lora=True):
+    def getlorapath(self, lora, strength, blocks=None, prev_lora=None, fuse_lora=True):
         loras_list = []
 
         lora = {
@@ -189,13 +190,14 @@ class FramePackLoraSelect:
             "strength": strength,
             "name": lora.split(".")[0],
             "fuse_lora": fuse_lora,
+            "blocks": blocks
         }
         if prev_lora is not None:
             loras_list.extend(prev_lora)
 
         loras_list.append(lora)
         return (loras_list,)
-    
+           
 class LoadFramePackModel:
     @classmethod
     def INPUT_TYPES(s):
@@ -214,7 +216,7 @@ class LoadFramePackModel:
                     "sageattn",
                     ], {"default": "sdpa"}),
                 "compile_args": ("FRAMEPACKCOMPILEARGS", ),
-                "lora": ("HYVIDLORA", {"default": None, "tooltip": "LORA model to load"}),
+                "lora": ("FPLORA", {"default": None, "tooltip": "LORA model to load"}),
             }
         }
 
