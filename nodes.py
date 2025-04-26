@@ -214,7 +214,7 @@ class LoadFramePackModel:
                     "sageattn",
                     ], {"default": "sdpa"}),
                 "compile_args": ("FRAMEPACKCOMPILEARGS", ),
-                "lora": ("FPLORA", {"default": None, "tooltip": "LORA model to load"}),
+                "lora": ("HYVIDLORA", {"default": None, "tooltip": "LORA model to load"}),
             }
         }
 
@@ -270,25 +270,41 @@ class LoadFramePackModel:
             adapter_list = []
             adapter_weights = []
             
+            def filter_lora_sd_by_blocks(lora_sd, selected_blocks):
+                filtered_lora_sd = {}
+                for key, val in lora_sd.items():
+                    for block in selected_blocks:
+                        if block in key:
+                            filtered_lora_sd[key] = val
+                            break
+                return filtered_lora_sd
+
             for l in lora:
                 fuse = True if l["fuse_lora"] else False
                 lora_sd = load_torch_file(l["path"])
                 lora_sd = _convert_hunyuan_video_lora_to_diffusers(lora_sd)
-                lora_rank = None            
-                for key, val in lora_sd.items():
+
+                # Use the provided blocks dictionary in `l["blocks"]`
+                selected_blocks = l["blocks"]
+                filtered_lora_sd = filter_lora_sd_by_blocks(lora_sd, selected_blocks)
+
+                lora_rank = None
+                for key, val in filtered_lora_sd.items():
                     if "lora_B" in key:
                         lora_rank = val.shape[1]
                         break
+
                 if lora_rank is not None:
-                    log.info(f"Merging rank {lora_rank} LoRA weights from {l['path']} with strength {l['strength']}")
+                    log.info(f"Merging rank {lora_rank} filtered LoRA weights from {l['path']} with strength {l['strength']}")
                     adapter_name = l['path'].split("/")[-1].split(".")[0]
                     adapter_weight = l['strength']
-                    transformer.load_lora_adapter(lora_sd, weight_name=l['path'].split("/")[-1], lora_rank=lora_rank, adapter_name=adapter_name)
-                    
+
+                    transformer.load_lora_adapter(filtered_lora_sd, weight_name=l['path'].split("/")[-1], lora_rank=lora_rank, adapter_name=adapter_name)
                     adapter_list.append(adapter_name)
                     adapter_weights.append(adapter_weight)
-                
+
                 del lora_sd
+                del filtered_lora_sd
                 mm.soft_empty_cache()
             if adapter_list:
                 transformer.set_adapters(adapter_list, weights=adapter_weights)
