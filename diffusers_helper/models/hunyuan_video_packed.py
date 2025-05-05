@@ -902,8 +902,7 @@ class HunyuanVideoTransformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, 
         temb = self.gradient_checkpointing_method(self.time_text_embed, timestep, guidance, pooled_projections)
         encoder_hidden_states = self.gradient_checkpointing_method(self.context_embedder, encoder_hidden_states, timestep, encoder_attention_mask)
 
-        if self.image_projection is not None:
-            assert image_embeddings is not None, 'You must use image embeddings!'
+        if self.image_projection is not None and image_embeddings is not None:
             extra_encoder_hidden_states = self.gradient_checkpointing_method(self.image_projection, image_embeddings)
             extra_attention_mask = torch.ones((batch_size, extra_encoder_hidden_states.shape[1]), dtype=encoder_attention_mask.dtype, device=encoder_attention_mask.device)
 

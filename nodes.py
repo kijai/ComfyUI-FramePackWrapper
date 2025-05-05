@@ -115,11 +115,11 @@ class DownloadAndLoadFramePackModel:
 
     def loadmodel(self, model, base_precision, quantization,
                   compile_args=None, attention_mode="sdpa"):
-        
+
         base_dtype = {"fp8_e4m3fn": torch.float8_e4m3fn, "fp8_e4m3fn_fast": torch.float8_e4m3fn, "bf16": torch.bfloat16, "fp16": torch.float16, "fp16_fast": torch.float16, "fp32": torch.float32}[base_precision]
 
         device = mm.get_torch_device()
-        
+
         model_path = os.path.join(folder_paths.models_dir, "diffusers", "lllyasviel", "FramePackI2V_HY")
         if not os.path.exists(model_path):
             print(f"Downloading clip model to: {model_path}")
@@ -151,7 +151,7 @@ class DownloadAndLoadFramePackModel:
             if compile_args["compile_double_blocks"]:
                 for i, block in enumerate(transformer.transformer_blocks):
                     transformer.transformer_blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
-               
+
             #transformer = torch.compile(transformer, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
 
         pipe = {
@@ -159,7 +159,7 @@ class DownloadAndLoadFramePackModel:
             "dtype": base_dtype,
         }
         return (pipe, )
-    
+
 class FramePackLoraSelect:
     @classmethod
     def INPUT_TYPES(s):
@@ -195,7 +195,7 @@ class FramePackLoraSelect:
 
         loras_list.append(lora)
         return (loras_list,)
-    
+
 class LoadFramePackModel:
     @classmethod
     def INPUT_TYPES(s):
@@ -225,7 +225,7 @@ class LoadFramePackModel:
 
     def loadmodel(self, model, base_precision, quantization,
                   compile_args=None, attention_mode="sdpa", lora=None, load_device="main_device"):
-        
+
         base_dtype = {"fp8_e4m3fn": torch.float8_e4m3fn, "fp8_e4m3fn_fast": torch.float8_e4m3fn, "bf16": torch.bfloat16, "fp16": torch.float16, "fp16_fast": torch.float16, "fp32": torch.float32}[base_precision]
 
         device = mm.get_torch_device()
@@ -241,49 +241,50 @@ class LoadFramePackModel:
         with open(model_config_path, "r") as f:
             config = json.load(f)
         sd = load_torch_file(model_path, device=offload_device, safe_load=True)
-        
+        model_weight_dtype = sd['single_transformer_blocks.0.attn.to_k.weight'].dtype
+
         with init_empty_weights():
             transformer = HunyuanVideoTransformer3DModel(**config, attention_mode=attention_mode)
-        
+
         params_to_keep = {"norm", "bias", "time_in", "vector_in", "guidance_in", "txt_in", "img_in"}
-        if lora is not None:
-            dtype = base_dtype
-        elif quantization == "fp8_e4m3fn" or quantization == "fp8_e4m3fn_fast" or quantization == "fp8_scaled":
+        if quantization == "fp8_e4m3fn" or quantization == "fp8_e4m3fn_fast" or quantization == "fp8_scaled":
             dtype = torch.float8_e4m3fn
         elif quantization == "fp8_e5m2":
             dtype = torch.float8_e5m2
         else:
             dtype = base_dtype
 
+        if lora is not None:
+            after_lora_dtype = dtype
+            dtype = base_dtype
+
         print("Using accelerate to load and assign model weights to device...")
         param_count = sum(1 for _ in transformer.named_parameters())
         for name, param in tqdm(transformer.named_parameters(),
-                desc=f"Loading transformer parameters to {transformer_load_device}", 
+                desc=f"Loading transformer parameters to {transformer_load_device}",
                 total=param_count,
                 leave=True):
             dtype_to_use = base_dtype if any(keyword in name for keyword in params_to_keep) else dtype
-   
-            set_module_tensor_to_device(transformer, name, device=transformer_load_device, dtype=dtype_to_use, value=sd[name])
 
+            set_module_tensor_to_device(transformer, name, device=transformer_load_device, dtype=dtype_to_use, value=sd[name])
 
         if lora is not None:
             adapter_list = []
             adapter_weights = []
-            
+
             for l in lora:
                 fuse = True if l["fuse_lora"] else False
                 lora_sd = load_torch_file(l["path"])
-                
-                
+
                 if "lora_unet_single_transformer_blocks_0_attn_to_k.lora_up.weight" in lora_sd:
                     from .utils import convert_to_diffusers
                     lora_sd = convert_to_diffusers("lora_unet_", lora_sd)
-                
+
                 if not "transformer.single_transformer_blocks.0.attn_to.k.lora_A.weight" in lora_sd:
                     log.info(f"Converting LoRA weights from {l['path']} to diffusers format...")
                     lora_sd = _convert_hunyuan_video_lora_to_diffusers(lora_sd)
 
-                lora_rank = None            
+                lora_rank = None
                 for key, val in lora_sd.items():
                     if "lora_B" in key or "lora_up" in key:
                         lora_rank = val.shape[1]
@@ -293,29 +294,32 @@ class LoadFramePackModel:
                     adapter_name = l['path'].split("/")[-1].split(".")[0]
                     adapter_weight = l['strength']
                     transformer.load_lora_adapter(lora_sd, weight_name=l['path'].split("/")[-1], lora_rank=lora_rank, adapter_name=adapter_name)
-                    
+
                     adapter_list.append(adapter_name)
                     adapter_weights.append(adapter_weight)
-                
+
                 del lora_sd
                 mm.soft_empty_cache()
             if adapter_list:
                 transformer.set_adapters(adapter_list, weights=adapter_weights)
                 if fuse:
+                    if model_weight_dtype not in [torch.float32, torch.float16, torch.bfloat16]:
+                        raise ValueError("Fusing LoRA doesn't work well with fp8 model weights. Please use a bf16 model file, or disable LoRA fusing.")
                     lora_scale = 1
                     transformer.fuse_lora(lora_scale=lora_scale)
                     transformer.delete_adapters(adapter_list)
 
-            if quantization == "fp8_e4m3fn" or quantization == "fp8_e4m3fn_fastmode":
+            if quantization == "fp8_e4m3fn" or quantization == "fp8_e4m3fn_fast" or quantization == "fp8_e5m2":
                 params_to_keep = {"norm", "bias", "time_in", "vector_in", "guidance_in", "txt_in", "img_in"}
                 for name, param in transformer.named_parameters():
-                    if not any(keyword in name for keyword in params_to_keep):
-                        param.data = param.data.to(torch.float8_e4m3fn)
+                    # Make sure to not cast the LoRA weights to fp8.
+                    if not any(keyword in name for keyword in params_to_keep) and not 'lora' in name:
+                        param.data = param.data.to(after_lora_dtype)
 
         if quantization == "fp8_e4m3fn_fast":
             from .fp8_optimization import convert_fp8_linear
             convert_fp8_linear(transformer, base_dtype, params_to_keep=params_to_keep)
-      
+
 
         DynamicSwapInstaller.install_model(transformer, device=device)
 
@@ -326,7 +330,7 @@ class LoadFramePackModel:
             if compile_args["compile_double_blocks"]:
                 for i, block in enumerate(transformer.transformer_blocks):
                     transformer.transformer_blocks[i] = torch.compile(block, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
-               
+
             #transformer = torch.compile(transformer, fullgraph=compile_args["fullgraph"], dynamic=compile_args["dynamic"], backend=compile_args["backend"], mode=compile_args["mode"])
 
         pipe = {
@@ -367,7 +371,6 @@ class FramePackSampler:
                 "model": ("FramePackMODEL",),
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
-                "image_embeds": ("CLIP_VISION_OUTPUT", ),
                 "steps": ("INT", {"default": 30, "min": 1}),
                 "use_teacache": ("BOOLEAN", {"default": True, "tooltip": "Use teacache for faster sampling."}),
                 "teacache_rel_l1_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The threshold for the relative L1 loss."}),
@@ -385,12 +388,15 @@ class FramePackSampler:
             },
             "optional": {
                 "start_latent": ("LATENT", {"tooltip": "init Latents to use for image2video"} ),
+                "image_embeds": ("CLIP_VISION_OUTPUT", ),
                 "end_latent": ("LATENT", {"tooltip": "end Latents to use for image2video"} ),
                 "end_image_embeds": ("CLIP_VISION_OUTPUT", {"tooltip": "end Image's clip embeds"} ),
                 "embed_interpolation": (["disabled", "weighted_average", "linear"], {"default": 'disabled', "tooltip": "Image embedding interpolation type. If linear, will smoothly interpolate with time, else it'll be weighted average with the specified weight."}),
                 "start_embed_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "Weighted average constant for image embed interpolation. If end image is not set, the embed's strength won't be affected"}),
                 "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "t2v_width": ("INT", {"default": 640, "min": 8, "step": 8, "tooltip": "Text-to-video width."}),
+                "t2v_height": ("INT", {"default": 640, "min": 8, "step": 8, "tooltip": "Text-to-video height."}),
             }
         }
 
@@ -399,8 +405,9 @@ class FramePackSampler:
     FUNCTION = "process"
     CATEGORY = "FramePackWrapper"
 
-    def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, image_embeds, steps, cfg,
-                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, end_latent=None, end_image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0):
+    def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, steps, cfg,
+                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, image_embeds=None, end_latent=None, end_image_embeds=None, embed_interpolation="linear", start_embed_strength=1.0, initial_samples=None, denoise_strength=1.0,
+                t2v_width=None, t2v_height=None):
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
         print("total_latent_sections: ", total_latent_sections)
@@ -415,7 +422,10 @@ class FramePackSampler:
         mm.cleanup_models()
         mm.soft_empty_cache()
 
-        start_latent = start_latent["samples"] * vae_scaling_factor
+        if start_latent is not None:
+            start_latent = start_latent["samples"] * vae_scaling_factor
+        else:
+            start_latent = torch.zeros([1, 16, 0, t2v_height // 8, t2v_width // 8])
         if initial_samples is not None:
             initial_samples = initial_samples["samples"] * vae_scaling_factor
         if end_latent is not None:
@@ -424,36 +434,38 @@ class FramePackSampler:
         print("start_latent", start_latent.shape)
         B, C, T, H, W = start_latent.shape
 
-        start_image_encoder_last_hidden_state = image_embeds["last_hidden_state"].to(base_dtype).to(device)
+        if image_embeds is not None:
+            start_image_encoder_last_hidden_state = image_embeds["last_hidden_state"].to(device, base_dtype)
 
         if has_end_image:
             assert end_image_embeds is not None
-            end_image_encoder_last_hidden_state = end_image_embeds["last_hidden_state"].to(base_dtype).to(device)
+            end_image_encoder_last_hidden_state = end_image_embeds["last_hidden_state"].to(device, base_dtype)
         else:
-            end_image_encoder_last_hidden_state = torch.zeros_like(start_image_encoder_last_hidden_state)
+            if image_embeds is not None:
+                end_image_encoder_last_hidden_state = torch.zeros_like(start_image_encoder_last_hidden_state)
 
-        llama_vec = positive[0][0].to(base_dtype).to(device)
-        clip_l_pooler = positive[0][1]["pooled_output"].to(base_dtype).to(device)
+        llama_vec = positive[0][0].to(device, base_dtype)
+        clip_l_pooler = positive[0][1]["pooled_output"].to(device, base_dtype)
 
         if not math.isclose(cfg, 1.0):
-            llama_vec_n = negative[0][0].to(base_dtype)
-            clip_l_pooler_n = negative[0][1]["pooled_output"].to(base_dtype).to(device)
+            llama_vec_n = negative[0][0].to(device, base_dtype)
+            clip_l_pooler_n = negative[0][1]["pooled_output"].to(device, base_dtype)
         else:
             llama_vec_n = torch.zeros_like(llama_vec, device=device)
             clip_l_pooler_n = torch.zeros_like(clip_l_pooler, device=device)
 
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
-            
+
 
         # Sampling
 
         rnd = torch.Generator("cpu").manual_seed(seed)
-        
+
         num_frames = latent_window_size * 4 - 3
 
         history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, H, W), dtype=torch.float32).cpu()
-       
+
         total_generated_latent_frames = 0
 
         latent_paddings_list = list(reversed(range(total_latent_sections)))
@@ -464,7 +476,7 @@ class FramePackSampler:
                 model_type=comfy.model_base.ModelType.FLOW,
                 device=device,
             )
-      
+
         patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, torch.device("cpu"))
         from latent_preview import prepare_callback
         callback = prepare_callback(patcher, steps)
@@ -485,23 +497,27 @@ class FramePackSampler:
             is_first_section = latent_padding == latent_paddings[0]
             latent_padding_size = latent_padding * latent_window_size
 
-            if embed_interpolation != "disabled":
-                if embed_interpolation == "linear":
-                    if total_latent_sections <= 1:
-                        frac = 1.0  # Handle case with only one section
+            if image_embeds is not None:
+                if embed_interpolation != "disabled":
+                    if embed_interpolation == "linear":
+                        if total_latent_sections <= 1:
+                            frac = 1.0  # Handle case with only one section
+                        else:
+                            frac = 1 - i / (total_latent_sections - 1)  # going backwards
                     else:
-                        frac = 1 - i / (total_latent_sections - 1)  # going backwards
-                else:
-                    frac = start_embed_strength if has_end_image else 1.0
+                        frac = start_embed_strength if has_end_image else 1.0
 
-                image_encoder_last_hidden_state = start_image_encoder_last_hidden_state * frac + (1 - frac) * end_image_encoder_last_hidden_state
+                    image_encoder_last_hidden_state = start_image_encoder_last_hidden_state * frac + (1 - frac) * end_image_encoder_last_hidden_state
+                else:
+                    image_encoder_last_hidden_state = start_image_encoder_last_hidden_state * start_embed_strength
             else:
-                image_encoder_last_hidden_state = start_image_encoder_last_hidden_state * start_embed_strength
+                image_encoder_last_hidden_state = None
 
             print(f'latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}, is_first_section = {is_first_section}')
 
-            indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
-            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([1, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
+            start_latent_frames = T  # 0 or 1
+            indices = torch.arange(0, sum([start_latent_frames, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
+            clean_latent_indices_pre, blank_indices, latent_indices, clean_latent_indices_post, clean_latent_2x_indices, clean_latent_4x_indices = indices.split([start_latent_frames, latent_padding_size, latent_window_size, 1, 2, 16], dim=1)
             clean_latent_indices = torch.cat([clean_latent_indices_pre, clean_latent_indices_post], dim=1)
 
             clean_latents_pre = start_latent.to(history_latents)
@@ -514,13 +530,13 @@ class FramePackSampler:
                 clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
             #vid2vid WIP
-            
+
             if initial_samples is not None:
                 total_length = initial_samples.shape[2]
-                
+
                 # Get the max padding value for normalization
                 max_padding = max(latent_paddings_list)
-                
+
                 if is_last_section:
                     # Last section should capture the end of the sequence
                     start_idx = max(0, total_length - latent_window_size)
@@ -532,11 +548,11 @@ class FramePackSampler:
                         start_idx = int(progress * max(0, total_length - latent_window_size))
                     else:
                         start_idx = 0
-                
+
                 end_idx = min(start_idx + latent_window_size, total_length)
                 print(f"start_idx: {start_idx}, end_idx: {end_idx}, total_length: {total_length}")
                 input_init_latents = initial_samples[:, :, start_idx:end_idx, :, :].to(device)
-          
+
 
             if use_teacache:
                 transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_rel_l1_thresh)
