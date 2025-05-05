@@ -617,7 +617,6 @@ class FramePackSamplerF1:
                 "model": ("FramePackMODEL",),
                 "positive": ("CONDITIONING",),
                 "negative": ("CONDITIONING",),
-                "image_embeds": ("CLIP_VISION_OUTPUT", ),
                 "steps": ("INT", {"default": 30, "min": 1}),
                 "use_teacache": ("BOOLEAN", {"default": True, "tooltip": "Use teacache for faster sampling."}),
                 "teacache_rel_l1_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The threshold for the relative L1 loss."}),
@@ -635,8 +634,11 @@ class FramePackSamplerF1:
             },
             "optional": {
                 "start_latent": ("LATENT", {"tooltip": "init Latents to use for image2video"} ),
+                "image_embeds": ("CLIP_VISION_OUTPUT", ),
                 "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
                 "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "t2v_width": ("INT", {"default": 640, "min": 8, "step": 8, "tooltip": "Text-to-video width."}),
+                "t2v_height": ("INT", {"default": 640, "min": 8, "step": 8, "tooltip": "Text-to-video height."}),
             }
         }
 
@@ -645,8 +647,9 @@ class FramePackSamplerF1:
     FUNCTION = "process"
     CATEGORY = "FramePackWrapper"
 
-    def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, image_embeds, steps, cfg,
-                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, initial_samples=None, denoise_strength=1.0):
+    def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, steps, cfg,
+                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, image_embeds=None, initial_samples=None, denoise_strength=1.0,
+                t2v_width=None, t2v_height=None):
         total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
         total_latent_sections = int(max(round(total_latent_sections), 1))
         print("total_latent_sections: ", total_latent_sections)
@@ -661,20 +664,26 @@ class FramePackSamplerF1:
         mm.cleanup_models()
         mm.soft_empty_cache()
 
-        start_latent = start_latent["samples"] * vae_scaling_factor
+        if start_latent is not None:
+            start_latent = start_latent["samples"] * vae_scaling_factor
+        else:
+            start_latent = torch.zeros([1, 16, 0, t2v_height // 8, t2v_width // 8])
         if initial_samples is not None:
             initial_samples = initial_samples["samples"] * vae_scaling_factor
         print("start_latent", start_latent.shape)
         B, C, T, H, W = start_latent.shape
 
-        image_encoder_last_hidden_state = image_embeds["last_hidden_state"].to(base_dtype).to(device)
+        if image_embeds is not None:
+            image_encoder_last_hidden_state = image_embeds["last_hidden_state"].to(base_dtype).to(device)
+        else:
+            image_encoder_last_hidden_state = None
 
-        llama_vec = positive[0][0].to(base_dtype).to(device)
-        clip_l_pooler = positive[0][1]["pooled_output"].to(base_dtype).to(device)
+        llama_vec = positive[0][0].to(device, base_dtype)
+        clip_l_pooler = positive[0][1]["pooled_output"].to(device, base_dtype)
 
         if not math.isclose(cfg, 1.0):
-            llama_vec_n = negative[0][0].to(base_dtype)
-            clip_l_pooler_n = negative[0][1]["pooled_output"].to(base_dtype).to(device)
+            llama_vec_n = negative[0][0].to(device, base_dtype)
+            clip_l_pooler_n = negative[0][1]["pooled_output"].to(device, base_dtype)
         else:
             llama_vec_n = torch.zeros_like(llama_vec, device=device)
             clip_l_pooler_n = torch.zeros_like(clip_l_pooler, device=device)
@@ -705,8 +714,9 @@ class FramePackSamplerF1:
             print(f'section_index = {section_index}, total_latent_sections = {total_latent_sections}')
 
             # Changed indices splitting to match new format
-            indices = torch.arange(0, sum([1, 16, 2, 1, latent_window_size])).unsqueeze(0)
-            clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split([1, 16, 2, 1, latent_window_size], dim=1)
+            start_latent_frames = T  # 0 or 1
+            indices = torch.arange(0, sum([start_latent_frames, 16, 2, 1, latent_window_size])).unsqueeze(0)
+            clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split([start_latent_frames, 16, 2, 1, latent_window_size], dim=1)
             clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
             
             # Changed clean latents extraction to match new format
