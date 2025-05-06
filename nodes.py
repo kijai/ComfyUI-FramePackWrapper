@@ -601,9 +601,178 @@ class FramePackSampler:
 
         return {"samples": real_history_latents / vae_scaling_factor},
 
+class FramePackSamplerF1:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("FramePackMODEL",),
+                "positive": ("CONDITIONING",),
+                "negative": ("CONDITIONING",),
+                "start_latent": ("LATENT", {"tooltip": "init Latents to use for image2video"} ),
+                "steps": ("INT", {"default": 30, "min": 1}),
+                "use_teacache": ("BOOLEAN", {"default": True, "tooltip": "Use teacache for faster sampling."}),
+                "teacache_rel_l1_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The threshold for the relative L1 loss."}),
+                "cfg": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 30.0, "step": 0.01}),
+                "guidance_scale": ("FLOAT", {"default": 10.0, "min": 0.0, "max": 32.0, "step": 0.01}),
+                "shift": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1000.0, "step": 0.01}),
+                "seed": ("INT", {"default": 0, "min": 0, "max": 0xffffffffffffffff}),
+                "latent_window_size": ("INT", {"default": 9, "min": 1, "max": 33, "step": 1, "tooltip": "The size of the latent window to use for sampling."}),
+                "total_second_length": ("FLOAT", {"default": 5, "min": 1, "max": 120, "step": 0.1, "tooltip": "The total length of the video in seconds."}),
+                "gpu_memory_preservation": ("FLOAT", {"default": 6.0, "min": 0.0, "max": 128.0, "step": 0.1, "tooltip": "The amount of GPU memory to preserve."}),
+                "sampler": (["unipc_bh1", "unipc_bh2"],
+                    {
+                        "default": 'unipc_bh1'
+                    }),
+            },
+            "optional": {
+                "image_embeds": ("CLIP_VISION_OUTPUT", ),
+                "initial_samples": ("LATENT", {"tooltip": "init Latents to use for video2video"} ),
+                "denoise_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT", )
+    RETURN_NAMES = ("samples",)
+    FUNCTION = "process"
+    CATEGORY = "FramePackWrapper"
+
+    def process(self, model, shift, positive, negative, latent_window_size, use_teacache, total_second_length, teacache_rel_l1_thresh, steps, cfg,
+                guidance_scale, seed, sampler, gpu_memory_preservation, start_latent=None, image_embeds=None, initial_samples=None, denoise_strength=1.0):
+        total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
+        total_latent_sections = int(max(round(total_latent_sections), 1))
+        print("total_latent_sections: ", total_latent_sections)
+
+        transformer = model["transformer"]
+        base_dtype = model["dtype"]
+
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+
+        mm.unload_all_models()
+        mm.cleanup_models()
+        mm.soft_empty_cache()
+
+        if start_latent is not None:
+            start_latent = start_latent["samples"] * vae_scaling_factor
+        
+        if initial_samples is not None:
+            initial_samples = initial_samples["samples"] * vae_scaling_factor
+        print("start_latent", start_latent.shape)
+        B, C, T, H, W = start_latent.shape
+
+        if image_embeds is not None:
+            image_encoder_last_hidden_state = image_embeds["last_hidden_state"].to(base_dtype).to(device)
+        else:
+            image_encoder_last_hidden_state = None
+
+        llama_vec = positive[0][0].to(device, base_dtype)
+        clip_l_pooler = positive[0][1]["pooled_output"].to(device, base_dtype)
+
+        if not math.isclose(cfg, 1.0):
+            llama_vec_n = negative[0][0].to(device, base_dtype)
+            clip_l_pooler_n = negative[0][1]["pooled_output"].to(device, base_dtype)
+        else:
+            llama_vec_n = torch.zeros_like(llama_vec, device=device)
+            clip_l_pooler_n = torch.zeros_like(clip_l_pooler, device=device)
+
+        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+
+        # Sampling
+        rnd = torch.Generator("cpu").manual_seed(seed)
+        
+        # Changed history_latents initialization to match new format
+        history_latents = torch.zeros(size=(1, 16, 16 + 2 + 1, H, W), dtype=torch.float32).cpu()
+        history_latents = torch.cat([history_latents, start_latent.to(history_latents)], dim=2)
+        total_generated_latent_frames = 1
+
+        comfy_model = HyVideoModel(
+                HyVideoModelConfig(base_dtype),
+                model_type=comfy.model_base.ModelType.FLOW,
+                device=device,
+            )
+        patcher = comfy.model_patcher.ModelPatcher(comfy_model, device, torch.device("cpu"))
+        from latent_preview import prepare_callback
+        callback = prepare_callback(patcher, steps)
+
+        move_model_to_device_with_memory_preservation(transformer, target_device=device, preserved_memory_gb=gpu_memory_preservation)
+
+        for section_index in range(total_latent_sections):
+            print(f'section_index = {section_index}, total_latent_sections = {total_latent_sections}')
+
+            # Changed indices splitting to match new format
+            start_latent_frames = T  # 0 or 1
+            indices = torch.arange(0, sum([start_latent_frames, 16, 2, 1, latent_window_size])).unsqueeze(0)
+            clean_latent_indices_start, clean_latent_4x_indices, clean_latent_2x_indices, clean_latent_1x_indices, latent_indices = indices.split([start_latent_frames, 16, 2, 1, latent_window_size], dim=1)
+            clean_latent_indices = torch.cat([clean_latent_indices_start, clean_latent_1x_indices], dim=1)
+            
+            # Changed clean latents extraction to match new format
+            clean_latents_4x, clean_latents_2x, clean_latents_1x = history_latents[:, :, -sum([16, 2, 1]):, :, :].split([16, 2, 1], dim=2)
+            clean_latents = torch.cat([start_latent.to(history_latents), clean_latents_1x], dim=2)
+
+            # vid2vid WIP
+            if initial_samples is not None:
+                total_length = initial_samples.shape[2]
+                section_latent_frames = latent_window_size * 2
+                start_idx = min(section_index * section_latent_frames, total_length - latent_window_size)
+                end_idx = min(start_idx + latent_window_size, total_length)
+                print(f"start_idx: {start_idx}, end_idx: {end_idx}, total_length: {total_length}")
+                input_init_latents = initial_samples[:, :, start_idx:end_idx, :, :].to(device)
+
+            if use_teacache:
+                transformer.initialize_teacache(enable_teacache=True, num_steps=steps, rel_l1_thresh=teacache_rel_l1_thresh)
+            else:
+                transformer.initialize_teacache(enable_teacache=False)
+
+            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=base_dtype, enabled=True):
+                generated_latents = sample_hunyuan(
+                    transformer=transformer,
+                    sampler=sampler,
+                    initial_latent=input_init_latents if initial_samples is not None else None,
+                    strength=denoise_strength,
+                    width=W * 8,
+                    height=H * 8,
+                    frames=latent_window_size * 4 - 3,  # Changed to match new format
+                    real_guidance_scale=cfg,
+                    distilled_guidance_scale=guidance_scale,
+                    guidance_rescale=0,
+                    shift=shift if shift != 0 else None,
+                    num_inference_steps=steps,
+                    generator=rnd,
+                    prompt_embeds=llama_vec,
+                    prompt_embeds_mask=llama_attention_mask,
+                    prompt_poolers=clip_l_pooler,
+                    negative_prompt_embeds=llama_vec_n,
+                    negative_prompt_embeds_mask=llama_attention_mask_n,
+                    negative_prompt_poolers=clip_l_pooler_n,
+                    device=device,
+                    dtype=base_dtype,
+                    image_embeddings=image_encoder_last_hidden_state,
+                    latent_indices=latent_indices,
+                    clean_latents=clean_latents,
+                    clean_latent_indices=clean_latent_indices,
+                    clean_latents_2x=clean_latents_2x,
+                    clean_latent_2x_indices=clean_latent_2x_indices,
+                    clean_latents_4x=clean_latents_4x,
+                    clean_latent_4x_indices=clean_latent_4x_indices,
+                    callback=callback,
+                )
+
+            total_generated_latent_frames += int(generated_latents.shape[2])
+            history_latents = torch.cat([history_latents, generated_latents.to(history_latents)], dim=2)
+
+            real_history_latents = history_latents[:, :, -total_generated_latent_frames:, :, :]
+
+        transformer.to(offload_device)
+        mm.soft_empty_cache()
+
+        return {"samples": real_history_latents / vae_scaling_factor},
+
 NODE_CLASS_MAPPINGS = {
     "DownloadAndLoadFramePackModel": DownloadAndLoadFramePackModel,
     "FramePackSampler": FramePackSampler,
+    "FramePackSamplerF1": FramePackSamplerF1,
     "FramePackTorchCompileSettings": FramePackTorchCompileSettings,
     "FramePackFindNearestBucket": FramePackFindNearestBucket,
     "LoadFramePackModel": LoadFramePackModel,
@@ -612,6 +781,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DownloadAndLoadFramePackModel": "(Down)Load FramePackModel",
     "FramePackSampler": "FramePackSampler",
+    "FramePackSamplerF1": "FramePackF1 Sampler",
     "FramePackTorchCompileSettings": "Torch Compile Settings",
     "FramePackFindNearestBucket": "Find Nearest Bucket",
     "LoadFramePackModel": "Load FramePackModel",
